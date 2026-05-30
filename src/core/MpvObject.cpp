@@ -394,34 +394,7 @@ void MpvObject::onMpvWakeup() {
                 break;
             }
             case MPV_EVENT_FILE_LOADED: {
-                // mpv successfully parsed the container and chose tracks.
-                // Dump everything we need to diagnose stream/codec issues
-                // without needing the user to reproduce.
-                const QString fmt    = mpvStr(m_mpv, "file-format");
-                const QString vcodec = mpvStr(m_mpv, "video-codec");
-                const QString acodec = mpvStr(m_mpv, "audio-codec");
-                const QString vfmt   = mpvStr(m_mpv, "video-format");
-                const QString afmt   = mpvStr(m_mpv, "audio-format");
-                int64_t w = 0, h = 0;
-                mpv_get_property(m_mpv, "width",  MPV_FORMAT_INT64, &w);
-                mpv_get_property(m_mpv, "height", MPV_FORMAT_INT64, &h);
-                Logger::instance().log(Logger::Info, "Mpv",
-                    QStringLiteral("file-loaded: container=%1 video=%2 (%3) %4x%5 audio=%6 (%7)")
-                        .arg(fmt.isEmpty()    ? "?" : fmt,
-                             vcodec.isEmpty() ? "—" : vcodec,
-                             vfmt.isEmpty()   ? "?" : vfmt)
-                        .arg(w).arg(h)
-                        .arg(acodec.isEmpty() ? "—" : acodec,
-                             afmt.isEmpty()   ? "?" : afmt));
-
-                // Full track-list — verbose but exactly what you want to see
-                // when "no streams selected" fires next time. JSON string is
-                // what mpv returns for the property in string form.
-                const QString tracks = mpvStr(m_mpv, "track-list");
-                if (!tracks.isEmpty()) {
-                    Logger::instance().log(Logger::Debug, "Mpv",
-                        QStringLiteral("track-list: %1").arg(tracks));
-                }
+                Logger::instance().log(Logger::Info, "Mpv", "file-loaded successfully");
                 break;
             }
             case MPV_EVENT_END_FILE: {
