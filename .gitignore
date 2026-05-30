@@ -43,3 +43,4 @@ logs/
 Thumbs.db
 desktop.ini
 *.7z
+filtered_logs.md
