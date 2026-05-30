@@ -66,6 +66,8 @@ VolchayWallapers/
 │   └── build-windows.yml       # CI: сборка .exe + installer
 ├── installer/
 │   └── volchay.iss             # Скрипт Inno Setup
+├── scripts/
+│   └── log_analyzer.py         # Скрипт для фильтрации и анализа логов
 ├── src/
 │   ├── main.cpp                # Точка входа, инициализация Logger, QGuiApplication, регистрация типов
 │   ├── core/
@@ -381,7 +383,7 @@ cmake --build build --config Release
   - Добавлен вызов `QQuickStyle::setStyle(QStringLiteral("Basic"));` для переключения стиля UI на базовый, поддерживающий полную настройку фонов и анимаций элементов управления.
 - **Правка `build.bat`:**
   - Добавлен поиск `libmpv-2.dll` в локальной папке SDK проекта `..\mpv-sdk\` в качестве резервного источника (fallback) при сборке.
-- **Затронутые файлы:** `src/main.cpp`, `build.bat`, `README.md` (этот журнал).
+- **Затронутые файлы:** `src/main.cpp`, `build.bat`, `scripts/log_analyzer.py`, `README.md` (этот журнал).
 
 ### Предложение по улучшению
 Кешировать **первый кадр** каждого видео библиотеки как PNG-миниатюру (`%LOCALAPPDATA%/Volchay/VolchayWallpapers/thumbs/<sha1(filePath)>.png`) и показывать её до запуска live-превью. Сейчас при наведении на карточку видна статичная иконка `play.svg` 200–500 мс, пока mpv инициализируется; с кешированной миниатюрой пользователь сразу увидит «о чём видео». Реализация: одноразовый проход по библиотеке через `mpv --frames=1 --vo=image-jpeg --o=...` (или через тот же `QQuickFramebufferObject` с `seek 25%` → `screenshot-raw`), сохранение в каталог thumbs, добавление роли `thumbnail` в `WallpaperLibrary` (она уже задумывалась — см. структуру в README, но не реализована). `WallpaperCard` показывает миниатюру как фон thumb, а live-превью поверх — плавный переход от статики к движению.
