@@ -1,0 +1,223 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [ main ]
+    tags:     [ "v*" ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (Windows, MSVC, Qt6)
+    runs-on: windows-2022
+
+    env:
+      QT_VERSION: 6.9.1
+      BUILD_TYPE: Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Qt via aqtinstall
+        shell: cmd
+        run: |
+          echo === python ===
+          python --version
+          if errorlevel 1 ( echo ::error::python not on PATH & exit /b 1 )
+          echo === pip upgrade ===
+          python -m pip install --upgrade pip
+          if errorlevel 1 ( echo ::error::pip upgrade failed & exit /b 1 )
+          echo === install aqtinstall ===
+          python -m pip install "aqtinstall>=3.2,<4" "py7zr"
+          if errorlevel 1 ( echo ::error::aqtinstall install failed & exit /b 1 )
+          echo === aqt version ===
+          python -m aqt version
+          if errorlevel 1 ( echo ::error::aqt version failed & exit /b 1 )
+          echo === download Qt (primary mirror) ===
+          rem qtsvg is part of base Qt 6 install, not a separate module — do not pass it via -m.
+          python -m aqt install-qt windows desktop %QT_VERSION% win64_msvc2022_64 -O "%GITHUB_WORKSPACE%\Qt"
+          if errorlevel 1 (
+            echo Primary mirror failed, retrying with qt.io fallback
+            python -m aqt install-qt -b https://download.qt.io/ windows desktop %QT_VERSION% win64_msvc2022_64 -O "%GITHUB_WORKSPACE%\Qt"
+            if errorlevel 1 ( echo ::error::aqt install-qt failed on both mirrors & exit /b 1 )
+          )
+          set "QT_DIR=%GITHUB_WORKSPACE%\Qt\%QT_VERSION%\msvc2022_64"
+          if not exist "%QT_DIR%\bin\qmake.exe" ( echo ::error::qmake.exe missing under %QT_DIR% & dir "%GITHUB_WORKSPACE%\Qt" /s /b & exit /b 1 )
+          echo Qt6_DIR=%QT_DIR%>>%GITHUB_ENV%
+          echo CMAKE_PREFIX_PATH=%QT_DIR%>>%GITHUB_ENV%
+          echo %QT_DIR%\bin>>%GITHUB_PATH%
+          echo === Done ===
+          dir "%QT_DIR%"
+
+      - name: Download libmpv SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url  = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20250101/mpv-dev-x86_64-20250101-git-2cf42a4.7z"
+          $dst  = "${{ github.workspace }}\mpv-dev.7z"
+          $root = "${{ github.workspace }}\mpv-dev"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          # Try the primary URL, fall back to the latest mpv-dev artifact tag listing if 404.
+          try {
+              Invoke-WebRequest -Uri $url -OutFile $dst
+          } catch {
+              $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases" `
+                                       -Headers @{ "Authorization" = "Bearer ${{ secrets.GITHUB_TOKEN }}"; "User-Agent" = "ci" }
+              $asset = $rel | ForEach-Object { $_.assets } | Where-Object { $_.name -like "mpv-dev-x86_64-*.7z" } | Select-Object -First 1
+              if (-not $asset) { throw "No mpv-dev asset found" }
+              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $dst
+          }
+          7z x $dst -o"$root" -y | Out-Null
+          # Some archives put include/ at root, others under a subdir. Normalize:
+          $includeDir = Get-ChildItem -Recurse -Path $root -Directory | Where-Object { $_.Name -eq "include" } | Select-Object -First 1
+          if (-not $includeDir) { throw "mpv-dev: include/ not found" }
+          $mpvRoot = $includeDir.Parent.FullName
+
+          # shinchiro's mpv-dev archive ships libmpv-2.dll plus a MinGW
+          # libmpv.dll.a — neither is usable as an MSVC import library.
+          # Generate mpv.lib ourselves: dumpbin /exports -> .def -> lib.exe.
+          $dll = Get-ChildItem -Recurse -Path $mpvRoot -Filter "libmpv-2.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+              $dll = Get-ChildItem -Recurse -Path $mpvRoot -Filter "mpv-2.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $dll) { throw "mpv-dev: libmpv-2.dll / mpv-2.dll not found under $mpvRoot" }
+          Write-Host "mpv DLL: $($dll.FullName)"
+
+          $libDir  = Join-Path $mpvRoot "lib"
+          New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+          $defOut  = Join-Path $libDir "mpv.def"
+          $libOut  = Join-Path $libDir "mpv.lib"
+
+          # Look up an existing .def first; fall back to dumpbin if absent.
+          $existingDef = Get-ChildItem -Recurse -Path $mpvRoot -Filter "*.def" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($existingDef) {
+              Write-Host "Using existing .def: $($existingDef.FullName)"
+              Copy-Item $existingDef.FullName $defOut -Force
+          } else {
+              Write-Host "No .def shipped; generating one from $($dll.Name) via dumpbin"
+              $dumpbinOut = & dumpbin.exe /exports $dll.FullName
+              if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit code $LASTEXITCODE" }
+              $exports = @()
+              $inTable = $false
+              foreach ($line in $dumpbinOut) {
+                  if ($line -match '^\s*ordinal\s+hint\s+RVA\s+name') { $inTable = $true; continue }
+                  if (-not $inTable) { continue }
+                  if ($line -match '^\s*Summary') { break }
+                  # Format: "    1    0 00001234 mpv_create"
+                  if ($line -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') {
+                      $exports += $Matches[1]
+                  }
+              }
+              if ($exports.Count -eq 0) { throw "dumpbin produced no exports for $($dll.FullName)" }
+              $defLines = @("LIBRARY $($dll.BaseName)", "EXPORTS") + $exports
+              Set-Content -Path $defOut -Value $defLines -Encoding ASCII
+              Write-Host "Wrote $defOut with $($exports.Count) exports"
+          }
+
+          # lib.exe is on PATH because ilammy/msvc-dev-cmd already ran.
+          & lib.exe "/def:$defOut" "/out:$libOut" /machine:X64
+          if ($LASTEXITCODE -ne 0) { throw "lib.exe failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path $libOut)) { throw "mpv.lib was not produced" }
+
+          echo "MPV_ROOT=$mpvRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "MPV root: $mpvRoot"
+          Get-ChildItem -Recurse $mpvRoot | Select-Object -First 60 | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cmake -S . -B build -G "Ninja" ^
+                -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
+                -DCMAKE_PREFIX_PATH="%Qt6_DIR%" ^
+                -DMPV_ROOT="%MPV_ROOT%"
+
+      - name: Build
+        shell: cmd
+        run: cmake --build build --config %BUILD_TYPE% --parallel
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "${{ github.workspace }}\stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "build\VolchayWallpapers.exe" $stage
+          Copy-Item "LICENSE" $stage
+          Copy-Item "README.md" $stage
+
+          # mpv runtime DLL — required at runtime; fail loudly if missing.
+          $dll = Get-ChildItem -Recurse -Path "$env:MPV_ROOT" -Filter "libmpv-2.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+              $dll = Get-ChildItem -Recurse -Path "$env:MPV_ROOT" -Filter "mpv-2.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $dll) { throw "libmpv runtime DLL not found under $env:MPV_ROOT" }
+          Copy-Item $dll.FullName $stage
+          Write-Host "mpv DLL: $($dll.FullName)"
+
+          # windeployqt enumerates EVERY plugin DLL in the Qt install and
+          # parses its PE headers — independent of what our binary actually
+          # links. On Qt 6.9.1 it crashes with STATUS_STACK_BUFFER_OVERRUN
+          # (0xC0000409) midway through plugins/sqldrivers/ (last successful
+          # read in CI was qsqlodbc.dll). We don't ship a SQL-using app, so
+          # the cheapest robust fix is to delete the plugin directories we
+          # demonstrably don't need BEFORE windeployqt sees them. Each
+          # removal also trims the portable build a bit.
+          $unused = @(
+              "sqldrivers",         # Qt6Sql — we don't link it
+              "networkinformation", # we don't make network calls
+              "printsupport",       # no printing
+              "designer",           # dev-time only
+              "qmlls", "qmllint",   # QML language server / linter
+              "help",               # Qt Assistant
+              "generic"             # extra input devices (TUIO etc.)
+          )
+          foreach ($p in $unused) {
+              $dir = Join-Path "$env:Qt6_DIR\plugins" $p
+              if (Test-Path $dir) {
+                  Write-Host "Pruning unused plugin dir: $dir"
+                  Remove-Item -Recurse -Force $dir
+              }
+          }
+
+          # --qmldir <abs>: absolute path side-steps a separate Qt 6.9.1
+          # qmlimportscanner crash on some relative-path inputs.
+          $qmlDir = (Resolve-Path "src\qml").Path
+          Write-Host "windeployqt --qmldir = $qmlDir"
+          & "$env:Qt6_DIR\bin\windeployqt.exe" `
+              --release `
+              --qmldir "$qmlDir" `
+              --no-translations `
+              --no-system-d3d-compiler `
+              "$stage\VolchayWallpapers.exe"
+          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed with exit code $LASTEXITCODE" }
+
+          Write-Host "=== stage/ manifest ==="
+          Get-ChildItem -Recurse $stage | ForEach-Object {
+              "{0,10}  {1}" -f $_.Length, $_.FullName.Substring($stage.Length + 1)
+          }
+
+      - name: Upload portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: VolchayWallpapers-portable
+          path: stage/**
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            stage/**
